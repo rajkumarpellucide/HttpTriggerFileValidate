@@ -9,6 +9,8 @@ using Microsoft.Extensions.Logging;
 using Newtonsoft.Json;
 using System.Text.RegularExpressions;
 using Azure.Messaging.ServiceBus;
+using Azure.Storage.Blobs;
+using System.Text;
 
 namespace FileValidateHttpTrigger
 {
@@ -186,6 +188,118 @@ namespace FileValidateHttpTrigger
                 return new StatusCodeResult(500); // Internal Server Error
             }
         }
-       
+        [FunctionName("BlobValidFilePost")]
+        public static async Task<IActionResult> BlobValidFilePost(
+            [HttpTrigger(AuthorizationLevel.Anonymous, "post", Route = null)] HttpRequest req,
+            ILogger log)
+        {
+            log.LogInformation("C# HTTP trigger function processed a request.");
+
+            // Read the request body
+            string requestBody = await new StreamReader(req.Body).ReadToEndAsync();
+            FileFormatData fileformatdata;
+            try
+            {
+                fileformatdata = JsonConvert.DeserializeObject<FileFormatData>(requestBody);
+            }
+            catch (JsonException ex)
+            {
+                log.LogError($"Error parsing request body: {ex.Message}");
+                return new BadRequestObjectResult("Invalid JSON in the request body.");
+            }
+            //dynamic fileformatdata = JsonConvert.DeserializeObject(requestBody);
+            string filedatamessage = fileformatdata?.FileName;
+
+            if (string.IsNullOrEmpty(filedatamessage))
+            {
+                log.LogWarning("Invalid request: Missing 'FileName' in the request body.");
+                return new BadRequestObjectResult("Please provide a valid 'FileName' in the request body.");
+            }
+
+            // Regular expression for the expected format            
+            var pattern = @"^(?<BusinessNumber>\d{15})\.(?<ReferenceTaskId>[a-fA-F0-9]{32})\.(?<DocumentType>[A-Z]{3})\.(?<Extension>pdf)$";
+            var match = System.Text.RegularExpressions.Regex.Match(filedatamessage, pattern);
+
+            if (!match.Success)
+            {
+                log.LogWarning($"File name '{filedatamessage}' does not match the expected format.");
+                return new BadRequestObjectResult($"File name '{filedatamessage}' does not match the expected format.");
+            }
+
+            // Extract details from the match
+            var businessNumber = match.Groups["BusinessNumber"].Value;
+            // Extract year and month from BusinessNumber
+            var patternb = @"^(\d{9})(\d{4})(\d{2})";
+            var matchb = Regex.Match(businessNumber, patternb);
+
+            if (!matchb.Success)
+            {
+                log.LogWarning($"Business number '{businessNumber}' does not match the expected sub-format.");
+                return new BadRequestObjectResult($"Invalid business number in file name '{filedatamessage}'.");
+            }
+            string businessnumber = matchb.Groups[1].Value;
+            var year = int.Parse(matchb.Groups[2].Value);
+            var month = int.Parse(matchb.Groups[3].Value);
+
+            
+            var referenceTaskId = match.Groups["ReferenceTaskId"].Value;
+            var documentType = match.Groups["DocumentType"].Value;
+            var extension = match.Groups["Extension"].Value;
+
+            // Validate month range (1-12)
+            if (month < 1 || month > 12)
+            {
+                log.LogWarning($"Invalid month value: {month} in file name '{filedatamessage}'.");
+                return new BadRequestObjectResult($"Invalid month value: {month} in file name '{filedatamessage}'");
+            }
+
+            // Prepare metadata as a JSON message Metadata preparation
+            var metadata = System.Text.Json.JsonSerializer.Serialize(new
+            {
+                BusinessNumber = businessnumber,
+                Year = year,
+                Month = month,
+                ReferenceTaskId = referenceTaskId,
+                DocumentType = documentType,
+                Extension = extension
+            });
+
+            // Blob Container communication
+            string connectionString = Environment.GetEnvironmentVariable("ConnectionStringBlobTrigger"); // Store your Service Bus connection string in the app settings
+            string blobContainerName = "samples-workitems"; // Replace with your actual queue name
+
+            if (string.IsNullOrEmpty(connectionString))
+            {
+                log.LogError("Blob storage connection string is missing.");
+                return new StatusCodeResult(500);
+            }
+            try
+            {
+               
+                // Create BlobContainerClient
+                var blobContainerClient = new BlobContainerClient(connectionString, blobContainerName);
+                await blobContainerClient.CreateIfNotExistsAsync();
+
+                // Upload metadata as a blob
+                //string blobName = $"{referenceTaskId}.json";
+                string blobName = filedatamessage;
+                var blobClient = blobContainerClient.GetBlobClient(blobName);
+                using var stream = new MemoryStream(Encoding.UTF8.GetBytes(metadata));
+                await blobClient.UploadAsync(stream, overwrite: true);
+
+                log.LogInformation($"Metadata blob uploaded successfully: {blobName}");
+                return new OkObjectResult("File metadata processed and uploaded to Blob Storage.");
+            }
+            catch (Exception ex)
+            {
+                log.LogError($"Error uploading metadata to Blob Storage: {ex.Message}");
+                return new StatusCodeResult(500);
+            }
+        }
+
+    }
+    public class FileFormatData
+    {
+        public string FileName { get; set; }
     }
 }
